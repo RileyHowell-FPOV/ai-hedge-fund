@@ -39,6 +39,8 @@ class Backtester:
         model_provider: str = "OpenAI",
         selected_analysts: list[str] = [],
         initial_margin_requirement: float = 0.0,
+        interval: str = "day",
+        interval_multiplier: int = 1,
     ):
         """
         :param agent: The trading agent (Callable).
@@ -50,6 +52,8 @@ class Backtester:
         :param model_provider: Which LLM provider (OpenAI, etc).
         :param selected_analysts: List of analyst names or IDs to incorporate.
         :param initial_margin_requirement: The margin ratio (e.g. 0.5 = 50%).
+        :param interval: Time interval for price data.
+        :param interval_multiplier: Multiplier for the interval.
         """
         self.agent = agent
         self.tickers = tickers
@@ -59,6 +63,8 @@ class Backtester:
         self.model_name = model_name
         self.model_provider = model_provider
         self.selected_analysts = selected_analysts
+        self.interval = interval
+        self.interval_multiplier = interval_multiplier
 
         # Initialize portfolio with support for long/short positions
         self.portfolio_values = []
@@ -274,7 +280,13 @@ class Backtester:
 
         for ticker in self.tickers:
             # Fetch price data for the entire period, plus 1 year
-            get_prices(ticker, start_date_str, self.end_date)
+            get_prices(
+                ticker,
+                start_date_str, 
+                self.end_date,
+                interval=self.interval,
+                interval_multiplier=self.interval_multiplier
+            )
 
             # Fetch financial metrics
             get_financial_metrics(ticker, self.end_date, limit=10)
@@ -291,61 +303,215 @@ class Backtester:
         # Pre-fetch all data at the start
         self.prefetch_data()
 
-        dates = pd.date_range(self.start_date, self.end_date, freq="B")
+        all_price_data = {}
+        min_date = None
+        max_date = None
+
+        # If using a sub-daily interval, fetch all data for the entire date range
+        # and iterate over the unique timestamps within that range.
+        # Otherwise (if interval is "day"), use the existing daily iteration logic.
+        if self.interval != "day":
+            print(f"\nRunning {self.interval} backtest from {self.start_date} to {self.end_date} with multiplier {self.interval_multiplier}x")
+            for ticker in self.tickers:
+                try:
+                    # Fetch all data for the entire date range with the specified interval
+                    df = get_price_data(ticker, self.start_date, self.end_date, self.interval, self.interval_multiplier)
+                    if not df.empty:
+                        all_price_data[ticker] = df.sort_index() 
+                        current_min_date = df.index.min()
+                        current_max_date = df.index.max()
+                        if min_date is None or current_min_date < min_date:
+                            min_date = current_min_date
+                        if max_date is None or current_max_date > max_date:
+                            max_date = current_max_date
+                    else:
+                        print(f"Warning: No {self.interval} price data for {ticker} between {self.start_date} and {self.end_date}. Skipping ticker for sub-daily processing.")
+                except Exception as e:
+                    print(f"Error fetching initial {self.interval} price data for {ticker} between {self.start_date} and {self.end_date}: {e}. Skipping ticker.")
+                    continue 
+            
+            if not all_price_data:
+                print(f"Error: No sub-daily price data found for any ticker for the range {self.start_date} - {self.end_date} at {self.interval} interval. Aborting backtest.")
+                return {}
+
+            unique_timestamps = pd.Index([])
+            for ticker_df in all_price_data.values():
+                unique_timestamps = unique_timestamps.union(ticker_df.index)
+            
+            unique_timestamps = unique_timestamps.sort_values()
+            iteration_points = unique_timestamps
+            if not iteration_points.empty:
+                print(f"Found {len(iteration_points)} unique timestamps for backtesting between {min_date} and {max_date}.")
+            else:
+                print(f"Warning: No unique timestamps found for {self.interval} backtest between {self.start_date} and {self.end_date} despite some ticker data being present. Check data alignment.")
+                return {}
+
+        else: # interval is "day"
+            iteration_points = pd.date_range(self.start_date, self.end_date, freq="B")
+            print(f"\nRunning daily backtest from {self.start_date} to {self.end_date}...")
+
+
         table_rows = []
         performance_metrics = {"sharpe_ratio": None, "sortino_ratio": None, "max_drawdown": None, "long_short_ratio": None, "gross_exposure": None, "net_exposure": None}
 
         print("\nStarting backtest...")
 
         # Initialize portfolio values list with initial capital
-        if len(dates) > 0:
-            self.portfolio_values = [{"Date": dates[0], "Portfolio Value": self.initial_capital}]
+        if len(iteration_points) > 0:
+            self.portfolio_values = [{"Date": iteration_points[0], "Portfolio Value": self.initial_capital}]
         else:
             self.portfolio_values = []
 
-        for current_date in dates:
-            lookback_start = (current_date - timedelta(days=30)).strftime("%Y-%m-%d")
-            current_date_str = current_date.strftime("%Y-%m-%d")
-            previous_date_str = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        for current_timestamp_or_date in iteration_points:
+            if self.interval != "day": # Covers both single-day and multi-day sub-daily
+                current_datetime_obj = current_timestamp_or_date 
+                current_date_str = current_datetime_obj.strftime("%Y-%m-%d %H:%M:%S") 
+                agent_lookback_start_date = (current_datetime_obj.normalize() - timedelta(days=30)).strftime("%Y-%m-%d")
+                agent_current_date = current_datetime_obj.strftime("%Y-%m-%d") 
+            else: # Daily backtesting
+                current_datetime_obj = current_timestamp_or_date # This is a pandas Timestamp (representing a business day)
+                current_date_str = current_datetime_obj.strftime("%Y-%m-%d")
+                agent_lookback_start_date = (current_datetime_obj - timedelta(days=30)).strftime("%Y-%m-%d")
+                agent_current_date = current_date_str
 
-            # Skip if there's no prior day to look back (i.e., first date in the range)
-            if lookback_start == current_date_str:
-                continue
+            # Skip if there's no prior day/timestamp to look back (i.e., first point in the range)
+            # This check might need refinement for intraday, but for now, a simple check for first item
+            if current_timestamp_or_date == iteration_points[0] and len(iteration_points) > 1:
+                 # For intraday, we still want to process the first timestamp unless it's the only one
+                 # For daily, we skip the first day if lookback_start == current_date_str, which is handled by original logic for daily.
+                 if not (self.interval != "day"):
+                    # This was the original condition for daily: if lookback_start == current_date_str: continue
+                    # We need to ensure agent_lookback_start_date is defined for this check if we reinstate it.
+                    # For now, the first timestamp for sub-daily will be processed.
+                    pass 
 
             # Get current prices for all tickers
             try:
                 current_prices = {}
-                missing_data = False
+                missing_data_for_timestamp = False
 
                 for ticker in self.tickers:
-                    try:
-                        price_data = get_price_data(ticker, previous_date_str, current_date_str)
-                        if price_data.empty:
-                            print(f"Warning: No price data for {ticker} on {current_date_str}")
-                            missing_data = True
-                            break
-                        current_prices[ticker] = price_data.iloc[-1]["close"]
-                    except Exception as e:
-                        print(f"Error fetching price for {ticker} between {previous_date_str} and {current_date_str}: {e}")
-                        missing_data = True
+                    if ticker not in all_price_data and self.interval != "day" and self.start_date == self.end_date:
+                        # This ticker was skipped during initial load for single-day, sub-daily interval
+                        # We need a strategy here - e.g., assume it can't be traded, or use last known price (which we don't have easily here)
+                        # For now, let's mark as missing data for this timestamp to skip trading this ticker at this point.
+                        # This implicitly means the agent won't be able to trade it if its data isn't loaded.
+                        # print(f"Skipping {ticker} at {current_date_str}, data not preloaded.")
+                        missing_data_for_timestamp = True 
                         break
+                    
+                    if self.interval != "day": # Covers both single-day and multi-day sub-daily
+                        # For sub-daily, get the price from the pre-fetched DataFrame
+                        # Use asof to get the latest price at or before the current_datetime_obj
+                        if ticker in all_price_data and not all_price_data[ticker].empty:
+                            # Ensure current_datetime_obj is timezone-aware if DataFrame index is, or vice-versa
+                            # Timestamps from price data might be tz-aware (e.g., UTC).
+                            # We need to make them compatible for comparison/lookup.
+                            df_ticker = all_price_data[ticker]
+                            
+                            # Timezone handling:
+                            # Ensure current_datetime_obj is correctly aligned with df_ticker.index.tz
+                            iteration_timestamp = pd.Timestamp(current_timestamp_or_date) # Ensure it's a pandas Timestamp
 
-                if missing_data:
-                    print(f"Skipping trading day {current_date_str} due to missing price data")
-                    continue
+                            if df_ticker.index.tz is not None: # DataFrame index is timezone-aware
+                                if iteration_timestamp.tz is None: # Iteration timestamp is naive
+                                    current_datetime_obj_localized = iteration_timestamp.tz_localize(df_ticker.index.tz)
+                                elif iteration_timestamp.tz != df_ticker.index.tz: # Both aware, but different timezones
+                                    current_datetime_obj_localized = iteration_timestamp.tz_convert(df_ticker.index.tz)
+                                else: # Both aware and same timezone
+                                    current_datetime_obj_localized = iteration_timestamp
+                            else: # DataFrame index is timezone-naive
+                                if iteration_timestamp.tz is not None: # Iteration timestamp is aware
+                                    current_datetime_obj_localized = iteration_timestamp.tz_convert(None) # Make it naive
+                                else: # Both naive
+                                    current_datetime_obj_localized = iteration_timestamp
+                            
+                            # Find the row for the current exact timestamp
+                            if current_datetime_obj_localized in df_ticker.index:
+                                price_at_timestamp = df_ticker.loc[current_datetime_obj_localized]
+                                if not pd.isna(price_at_timestamp["close"]):
+                                    current_prices[ticker] = price_at_timestamp["close"]
+                                else:
+                                    # print(f"Warning: No explicit close price for {ticker} at {current_date_str}. Using asof.")
+                                    # Fallback to asof if exact match has NaN close, or if needed
+                                    price_series = df_ticker["close"].asof(current_datetime_obj_localized)
+                                    if not pd.isna(price_series):
+                                        current_prices[ticker] = price_series
+                                    else:
+                                        # print(f"Warning: No price data (asof) for {ticker} at {current_date_str}")
+                                        missing_data_for_timestamp = True
+                                        break
+                            else:
+                                # If exact timestamp not found, try asof - this implies data might be sparse for some tickers
+                                price_series = df_ticker["close"].asof(current_datetime_obj_localized)
+                                if not pd.isna(price_series):
+                                    current_prices[ticker] = price_series
+                                else:
+                                    # print(f"Warning: No price data (asof) for {ticker} at {current_date_str} (exact timestamp not found)")
+                                    missing_data_for_timestamp = True
+                                    break
+                        else:
+                            # print(f"Warning: No preloaded data for {ticker} at {current_date_str}")
+                            missing_data_for_timestamp = True
+                            break
+                    else: # Daily backtesting price fetching
+                        # For daily, get_price_data fetches for a [previous_date, current_date] range.
+                        # The agent decision is for current_date, based on data up to previous_date.
+                        # Trades execute at current_date's close.
+                        # We need the closing price of current_date_str for execution and valuation.
+                        # For simplicity and consistency, let's assume get_price_data called with current_date_str for both start and end
+                        # will give us the data for that specific day, and we can take the close.
+                        # The original logic used previous_date to current_date which might be for agent lookback within get_price_data.
+                        # Let's fetch for current_date_str to ensure we get today's close for execution.
+                        price_data_df = get_price_data(ticker, current_date_str, current_date_str) # Fetch for the specific day
+                        if price_data_df.empty or pd.isna(price_data_df.iloc[-1]["close"]):
+                            # print(f"Warning: No closing price data for {ticker} on {current_date_str}")
+                            missing_data_for_timestamp = True
+                            break
+                        current_prices[ticker] = price_data_df.iloc[-1]["close"]
+
+                if missing_data_for_timestamp or len(current_prices) != len(self.tickers):
+                    # print(f"Skipping trading point {current_date_str} due to missing price data for one or more tickers.")
+                    # If data is missing for a timestamp, we should ideally record the portfolio value with last known prices
+                    # but not execute new trades or run the agent. For now, we skip the agent call.
+                    # Let's ensure all tickers have a price, even if it's carried forward, before calculating portfolio value.
+                    # This part needs careful handling of how to proceed when some tickers have data and others don't at a specific timestamp.
+                    # For now, if any data is missing, we might just skip this timestamp for agent decisions.
+                    # However, portfolio valuation should ideally still happen.
+                    # A simple skip for now:
+                    if missing_data_for_timestamp:
+                        print(f"Skipping agent decision at {current_date_str} due to missing price data for one or more tickers.")
+                        # Still attempt to log portfolio value if possible
+                        # This needs robust handling of potentially stale prices if we carry them forward.
+                        # For now, if crucial data is missing, we might not be ableable to accurately value.
+                        # Let's assume if current_prices is not fully populated, we can't reliably value or trade.
+                        if len(current_prices) == len(self.tickers):
+                             total_value_at_skip = self.calculate_portfolio_value(current_prices)
+                             self.portfolio_values.append({"Date": current_datetime_obj, "Portfolio Value": total_value_at_skip})
+                        else:
+                            print(f"Cannot reliably value portfolio at {current_date_str} due to insufficient price data. Carrying forward last value.")
+                            if self.portfolio_values:
+                                self.portfolio_values.append({"Date": current_datetime_obj, "Portfolio Value": self.portfolio_values[-1]["Portfolio Value"]})
+                            else:
+                                self.portfolio_values.append({"Date": current_datetime_obj, "Portfolio Value": self.initial_capital})
+                        continue # Skip agent and trading if critical price data is missing
 
             except Exception as e:
-                # If there's a general API error, log it and skip this day
-                print(f"Error fetching prices for {current_date_str}: {e}")
+                # If there's a general API error or other error fetching prices for this timestamp
+                print(f"Error fetching prices for {current_date_str}: {e}. Skipping this point.")
+                if self.portfolio_values: # Carry forward last known portfolio value
+                    self.portfolio_values.append({"Date": current_datetime_obj, "Portfolio Value": self.portfolio_values[-1]["Portfolio Value"]})
+                else:
+                    self.portfolio_values.append({"Date": current_datetime_obj, "Portfolio Value": self.initial_capital})
                 continue
 
-            # ---------------------------------------------------------------
             # 1) Execute the agent's trades
             # ---------------------------------------------------------------
+            # Agent's view of dates: agent_lookback_start_date and agent_current_date
             output = self.agent(
                 tickers=self.tickers,
-                start_date=lookback_start,
-                end_date=current_date_str,
+                start_date=agent_lookback_start_date, # Agent's historical lookback start (e.g., T-30 days)
+                end_date=agent_current_date,      # Agent's current decision point (e.g., current day for daily, or current day for intraday)
                 portfolio=self.portfolio,
                 model_name=self.model_name,
                 model_provider=self.model_provider,
@@ -379,7 +545,7 @@ class Backtester:
             long_short_ratio = long_exposure / short_exposure if short_exposure > 1e-9 else float("inf")
 
             # Track each day's portfolio value in self.portfolio_values
-            self.portfolio_values.append({"Date": current_date, "Portfolio Value": total_value, "Long Exposure": long_exposure, "Short Exposure": short_exposure, "Gross Exposure": gross_exposure, "Net Exposure": net_exposure, "Long/Short Ratio": long_short_ratio})
+            self.portfolio_values.append({"Date": current_datetime_obj, "Portfolio Value": total_value, "Long Exposure": long_exposure, "Short Exposure": short_exposure, "Gross Exposure": gross_exposure, "Net Exposure": net_exposure, "Long/Short Ratio": long_short_ratio})
 
             # ---------------------------------------------------------------
             # 3) Build the table rows to display
@@ -399,8 +565,17 @@ class Backtester:
 
                 # Calculate net position value
                 pos = self.portfolio["positions"][ticker]
-                long_val = pos["long"] * current_prices[ticker]
-                short_val = pos["short"] * current_prices[ticker]
+                # Ensure current_prices[ticker] exists, otherwise, this day/timestamp might have been skipped for this ticker
+                price_for_valuation = current_prices.get(ticker)
+                if price_for_valuation is None:
+                    # This should ideally not happen if we skipped the agent call when data was missing.
+                    # If it does, we need a fallback or error. For now, assume 0 if price is missing.
+                    print(f"Critical Error: Price for {ticker} missing at {current_date_str} during table row generation.")
+                    long_val = 0
+                    short_val = 0
+                else:
+                    long_val = pos["long"] * price_for_valuation
+                    short_val = pos["short"] * price_for_valuation
                 net_position_value = long_val - short_val
 
                 # Get the action and quantity from the decisions
@@ -414,7 +589,7 @@ class Backtester:
                         ticker=ticker,
                         action=action,
                         quantity=quantity,
-                        price=current_prices[ticker],
+                        price=current_prices.get(ticker, 0), # Use .get for safety
                         shares_owned=pos["long"] - pos["short"],  # net shares
                         position_value=net_position_value,
                         bullish_count=bullish_count,
@@ -641,6 +816,18 @@ if __name__ == "__main__":
         help="Margin ratio for short positions, e.g. 0.5 for 50% (default: 0.0)",
     )
     parser.add_argument("--ollama", action="store_true", help="Use Ollama for local LLM inference")
+    parser.add_argument(
+        "--interval",
+        type=str,
+        default="day",
+        help="Time interval for price data (e.g., second, minute, hour, day, week, month, year)",
+    )
+    parser.add_argument(
+        "--interval-multiplier",
+        type=int,
+        default=1,
+        help="Multiplier for the interval (e.g., 5 for 5 minutes)",
+    )
 
     args = parser.parse_args()
 
@@ -754,6 +941,8 @@ if __name__ == "__main__":
         model_provider=model_provider,
         selected_analysts=selected_analysts,
         initial_margin_requirement=args.margin_requirement,
+        interval=args.interval,
+        interval_multiplier=args.interval_multiplier,
     )
 
     performance_metrics = backtester.run_backtest()

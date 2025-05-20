@@ -1,12 +1,13 @@
 import math
+import json
+from typing import Literal
+import numpy as np
 
 from langchain_core.messages import HumanMessage
 
 from src.graph.state import AgentState, show_agent_reasoning
 
-import json
 import pandas as pd
-import numpy as np
 
 from src.tools.api import get_prices, prices_to_df
 from src.utils.progress import progress
@@ -86,31 +87,31 @@ def technical_analyst_agent(state: AgentState):
         # Generate detailed analysis report for this ticker
         technical_analysis[ticker] = {
             "signal": combined_signal["signal"],
-            "confidence": round(combined_signal["confidence"] * 100),
+            "confidence": round(float(np.nan_to_num(combined_signal["confidence"], nan=0.5)) * 100),
             "strategy_signals": {
                 "trend_following": {
                     "signal": trend_signals["signal"],
-                    "confidence": round(trend_signals["confidence"] * 100),
+                    "confidence": round(float(np.nan_to_num(trend_signals["confidence"], nan=0.5)) * 100),
                     "metrics": normalize_pandas(trend_signals["metrics"]),
                 },
                 "mean_reversion": {
                     "signal": mean_reversion_signals["signal"],
-                    "confidence": round(mean_reversion_signals["confidence"] * 100),
+                    "confidence": round(float(np.nan_to_num(mean_reversion_signals["confidence"], nan=0.5)) * 100),
                     "metrics": normalize_pandas(mean_reversion_signals["metrics"]),
                 },
                 "momentum": {
                     "signal": momentum_signals["signal"],
-                    "confidence": round(momentum_signals["confidence"] * 100),
+                    "confidence": round(float(np.nan_to_num(momentum_signals["confidence"], nan=0.5)) * 100),
                     "metrics": normalize_pandas(momentum_signals["metrics"]),
                 },
                 "volatility": {
                     "signal": volatility_signals["signal"],
-                    "confidence": round(volatility_signals["confidence"] * 100),
+                    "confidence": round(float(np.nan_to_num(volatility_signals["confidence"], nan=0.5)) * 100),
                     "metrics": normalize_pandas(volatility_signals["metrics"]),
                 },
                 "statistical_arbitrage": {
                     "signal": stat_arb_signals["signal"],
-                    "confidence": round(stat_arb_signals["confidence"] * 100),
+                    "confidence": round(float(np.nan_to_num(stat_arb_signals["confidence"], nan=0.5)) * 100),
                     "metrics": normalize_pandas(stat_arb_signals["metrics"]),
                 },
             },
